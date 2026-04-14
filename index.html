@@ -798,6 +798,8 @@ class Fighter {
     this.maxHp = char.hp;
     this.meter = 0;
     this.maxMeter = 100;
+    this.guardGauge = 100;
+    this.maxGuardGauge = 100;
     this.state = 'idle'; // idle, walk, jump, attack_light, attack_heavy, special, block, hit, ko
     this.stateTimer = 0;
     this.animFrame = 0;
@@ -842,6 +844,7 @@ class Fighter {
     this.poisonDmg = 0;
     this.strBoost = 0;
     this.strBoostTimer = 0;
+    this.guardGauge = 100;
   }
 
   getHitbox() {
@@ -873,6 +876,11 @@ class Fighter {
       }
     }
 
+    // Guard gauge auto-recovery (when not blocking)
+    if (this.state !== 'block' && !this.guardBroken) {
+      this.guardGauge = Math.min(this.maxGuardGauge, this.guardGauge + 0.3);
+    }
+
     // Guard break recovery
     if (this.guardBroken) {
       this.guardBreakTimer--;
@@ -880,6 +888,7 @@ class Fighter {
         this.guardBroken = false;
         this.blockCount = 0;
         this.state = 'idle';
+        this.guardGauge = 30; // partial recovery after break
       }
       // Still apply physics during guard break (don't return)
     }
@@ -921,6 +930,14 @@ class Fighter {
       if (this.stateTimer <= 0) {
         this.state = 'idle';
         this.specialActive = false;
+      }
+    }
+
+    if (this.state === 'guardbreak') {
+      this.stateTimer--;
+      if (this.stateTimer <= 0) {
+        this.state = 'idle';
+        this.guardBroken = false;
       }
     }
 
@@ -992,7 +1009,7 @@ class Fighter {
           } else {
             this.comboCount = 0;
           }
-          this.comboTimer = 20;
+          this.comboTimer = 60; // 1 second window
         }
       }
     }
@@ -1018,15 +1035,22 @@ class Fighter {
   takeDamage(dmg, knockbackX) {
     if (this.invincible) return;
     if (this.state === 'block' && !this.guardBroken) {
-      // Blocked
-      const blocked = dmg * 0.3; // chip damage
-      this.hp = Math.max(0, this.hp - blocked);
-      this.blockCount++;
-      if (this.blockCount >= 3) {
+      // Blocked - consume guard gauge
+      const chipDmg = dmg * 0.2;
+      this.hp = Math.max(0, this.hp - chipDmg);
+      this.guardGauge -= dmg * 1.5;
+      if (this.guardGauge <= 0) {
+        // Guard break!
+        this.guardGauge = 0;
         this.guardBroken = true;
-        this.guardBreakTimer = 40;
-        this.state = 'hit';
-        this.stateTimer = 40;
+        this.guardBreakTimer = 60;
+        this.state = 'guardbreak';
+        this.stateTimer = 60;
+        addFloatingText(this.x, this.y - 70, 'GUARD BREAK!', '#ff0', 18);
+        addScreenShake(10);
+        addParticle(this.x, this.y - 25, '#ff0', 12);
+        playSound(150, 0.3, 'sawtooth', 0.2);
+        vibrate(100);
       }
       this.vx = knockbackX * 0.3;
       sfxBlock();
@@ -1050,6 +1074,7 @@ class Fighter {
   draw(ctx) {
     const drawState = this.state === 'attack_light' || this.state === 'attack_heavy' ? this.state :
                       this.state === 'block' ? 'block' :
+                      this.state === 'guardbreak' ? 'hit' :
                       this.state === 'hit' || this.state === 'ko' ? 'hit' :
                       this.state === 'walk' ? 'walk' : 'idle';
 
@@ -1059,6 +1084,22 @@ class Fighter {
       dx = (Math.random()-0.5) * 4;
       dy = (Math.random()-0.5) * 4;
       this.shakeTimer--;
+    }
+
+    // Guard break dizzy effect
+    if (this.state === 'guardbreak') {
+      dx += Math.sin(this.animFrame * 0.3) * 3;
+      // Dizzy stars
+      ctx.save();
+      ctx.fillStyle = '#ff0';
+      for (let i = 0; i < 3; i++) {
+        const angle = this.animFrame * 0.1 + i * 2.1;
+        const sx = this.x + Math.cos(angle) * 18;
+        const sy = this.y - 55 + Math.sin(angle) * 8;
+        ctx.font = '10px monospace';
+        ctx.fillText('★', sx, sy);
+      }
+      ctx.restore();
     }
 
     // Invincibility flash
@@ -1939,7 +1980,10 @@ function updateFight() {
   }
 
   // Combo display timer
-  if (comboDisplay.timer > 0) comboDisplay.timer--;
+  if (comboDisplay.timer > 0) {
+    comboDisplay.timer--;
+    if (comboDisplay.timer <= 0) comboDisplay.count = 0; // reset combo after 1 sec
+  }
 
   // Player input from buttons
   player1.input.left = isButtonPressed('left');
@@ -2049,7 +2093,11 @@ function checkAttackCollision(attacker, defender) {
     } else {
       dmg = str * 0.6;
       // Combo bonus
-      if (attacker.comboCount > 0) dmg *= (1 + attacker.comboCount * 0.15);
+      // Combo damage bonus based on hit combo count
+      const comboHits = attacker === player1 ? comboDisplay.count : 0;
+      if (attacker.comboCount > 0 || comboHits > 0) {
+        dmg *= (1 + Math.max(attacker.comboCount, comboHits) * 0.1);
+      }
     }
 
     // Defense reduction
@@ -2102,35 +2150,112 @@ function handleSpecialEffects(user, target) {
   if (!user.specialActive || user.specialTimer !== 29) return;
 
   const special = user.char.special;
+  addFloatingText(user.x, user.y - 75, special, '#f0f', 14);
+  addScreenShake(8);
+
   if (special === '毒キノコの怒り') {
+    // Poison cloud expands from user to target
     target.poisonTimer = 120;
     target.poisonDmg = 1;
-    addParticle(target.x, target.y - 25, '#0f0', 15);
+    for (let i = 0; i < 20; i++) {
+      addParticle(user.x + (target.x - user.x) * i/20, user.y - 25 + (Math.random()-0.5)*30, '#0f0', 2);
+    }
+    addFloatingText(target.x, target.y - 50, 'POISON!', '#0f0', 14);
+    playSound(100, 0.4, 'sawtooth', 0.1);
   } else if (special === 'お父さんパワー') {
+    // Golden aura explosion
     user.invincible = true;
     user.invTimer = 90;
-    addParticle(user.x, user.y - 25, '#ff0', 15);
+    for (let i = 0; i < 25; i++) {
+      const angle = (i / 25) * Math.PI * 2;
+      addParticle(user.x + Math.cos(angle)*5, user.y - 25 + Math.sin(angle)*5, i%2===0 ? '#ff0' : '#fa0', 3);
+    }
+    addFloatingText(user.x, user.y - 90, '無敵！', '#ff0', 18);
+    playSound(440, 0.3, 'triangle', 0.15);
   } else if (special === '呪いの舐め') {
-    if (Math.abs(user.x - target.x) < 80) {
-      target.state = 'hit';
-      target.stateTimer = 45;
+    // Tongue projectile visual
+    if (Math.abs(user.x - target.x) < 100) {
+      target.state = 'guardbreak';
+      target.stateTimer = 50;
       target.guardBroken = true;
-      target.guardBreakTimer = 45;
-      addParticle(target.x, target.y - 25, '#f0f', 15);
+      target.guardBreakTimer = 50;
+      for (let i = 0; i < 15; i++) {
+        addParticle(target.x + (Math.random()-0.5)*20, target.y - 25, '#f0f', 2);
+      }
+      addFloatingText(target.x, target.y - 50, 'STUN!', '#f0f', 16);
+      playSound(200, 0.2, 'sine', 0.15);
     }
   } else if (special === 'アイデンティティ崩壊') {
+    // Clone explosion effect
     user.invincible = true;
     user.invTimer = 60;
     user.strBoost = 2;
     user.strBoostTimer = 60;
-    addParticle(user.x, user.y - 25, '#fff', 20);
+    for (let i = 0; i < 30; i++) {
+      addParticle(user.x + (Math.random()-0.5)*40, user.y - 25 + (Math.random()-0.5)*40, '#fff', 2);
+    }
+    addFloatingText(user.x, user.y - 90, 'POWER UP!', '#fff', 16);
+    playSound(300, 0.2, 'square', 0.15);
+    playSound(600, 0.15, 'sine', 0.1);
+  } else if (special === '超必殺・気合砲') {
+    // Energy beam across screen
+    const dir = user.facing;
+    const dmg = user.char.str * 2.5;
+    if (Math.abs(user.x - target.x) < 200) {
+      target.takeDamage(dmg, dir * 8);
+    }
+    for (let i = 0; i < 30; i++) {
+      addParticle(user.x + dir * i * 8, user.y - 25 + (Math.random()-0.5)*10, '#0ff', 2);
+    }
+    addScreenShake(12);
+    playSound(150, 0.4, 'sawtooth', 0.2);
+  } else if (special === '大地震パンチ') {
+    // Ground pound - damages if close
+    if (Math.abs(user.x - target.x) < 80) {
+      target.takeDamage(user.char.str * 2, user.facing * 10);
+      target.vy = -8;
+    }
+    for (let i = 0; i < 20; i++) {
+      addParticle(user.x + (Math.random()-0.5)*80, GROUND_Y - 5, '#864', 3);
+    }
+    addScreenShake(15);
+    playSound(60, 0.5, 'sawtooth', 0.2);
+  } else if (special === 'ハイパービーム') {
+    // Rainbow beam
+    const dir = user.facing;
+    const colors = ['#f00','#f80','#ff0','#0f0','#0ff','#00f','#f0f'];
+    for (let i = 0; i < 35; i++) {
+      addParticle(user.x + dir * i * 7, user.y - 25 + (Math.random()-0.5)*15, colors[i%7], 2);
+    }
+    if (Math.abs(user.x - target.x) < 180) {
+      target.takeDamage(user.char.str * 2.2, dir * 6);
+    }
+    addScreenShake(10);
+    playSound(500, 0.3, 'square', 0.15);
+    playSound(700, 0.2, 'sine', 0.1);
+  } else if (special === '竜巻旋風脚') {
+    // Spinning kick - moves toward opponent
+    const dir = user.facing;
+    user.vx = dir * 8;
+    user.strBoost = 4;
+    user.strBoostTimer = 40;
+    user.invincible = true;
+    user.invTimer = 30;
+    for (let i = 0; i < 15; i++) {
+      const angle = (i / 15) * Math.PI * 2;
+      addParticle(user.x + Math.cos(angle)*15, user.y - 25 + Math.sin(angle)*15, '#8af', 2);
+    }
+    playSound(250, 0.3, 'triangle', 0.15);
   } else {
     // Default: rush attack
     const dir = user.facing;
     user.vx = dir * 12;
     user.strBoost = 3;
     user.strBoostTimer = 30;
-    addParticle(user.x, user.y - 25, '#f80', 15);
+    for (let i = 0; i < 10; i++) {
+      addParticle(user.x, user.y - 25 + (Math.random()-0.5)*20, '#f80', 3);
+    }
+    playSound(200, 0.2, 'sawtooth', 0.15);
   }
 }
 
@@ -2313,13 +2438,29 @@ function drawHUD() {
   ctx.fillStyle = player2.meter >= player2.maxMeter ? '#f5a623' : '#885510';
   ctx.fillRect(W - 10 - barW * (player2.meter / player2.maxMeter), barY + barH + 3, barW * (player2.meter / player2.maxMeter), mBarH);
 
+  // Guard gauge bars
+  const gBarY = barY + barH + mBarH + 5;
+  const gBarH = 4;
+  // P1 guard
+  ctx.fillStyle = '#222';
+  ctx.fillRect(10, gBarY, barW, gBarH);
+  const g1Ratio = player1.guardGauge / player1.maxGuardGauge;
+  ctx.fillStyle = g1Ratio > 0.3 ? '#48f' : '#f44';
+  ctx.fillRect(10, gBarY, barW * g1Ratio, gBarH);
+  // P2 guard
+  ctx.fillStyle = '#222';
+  ctx.fillRect(W - 10 - barW, gBarY, barW, gBarH);
+  const g2Ratio = player2.guardGauge / player2.maxGuardGauge;
+  ctx.fillStyle = g2Ratio > 0.3 ? '#48f' : '#f44';
+  ctx.fillRect(W - 10 - barW * g2Ratio, gBarY, barW * g2Ratio, gBarH);
+
   // Names
   ctx.font = '10px monospace';
   ctx.fillStyle = '#aaa';
   ctx.textAlign = 'left';
-  ctx.fillText(playerChar?.name || 'P1', 10, barY + barH + 20);
+  ctx.fillText(playerChar?.name || 'P1', 10, gBarY + gBarH + 10);
   ctx.textAlign = 'right';
-  ctx.fillText(opponentChar?.name || 'P2', W - 10, barY + barH + 20);
+  ctx.fillText(opponentChar?.name || 'P2', W - 10, gBarY + gBarH + 10);
 
   // Timer
   ctx.fillStyle = '#fff';
