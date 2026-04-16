@@ -1892,8 +1892,15 @@ function startFight() {
 }
 
 function startRound() {
-  player1 = new Fighter(playerChar, 120, 1, true);
-  player2 = new Fighter(opponentChar, 280, -1, false);
+  // In online mode:
+  //   HOST:   player1 = my char (left),  player2 = opponent char (right)
+  //   CLIENT: player1 = opponent char (host's fighter), player2 = my char
+  // This ensures player1/player2 positions match between host and client
+  const isClient = isOnline && !isHost;
+  const p1Char = isClient ? opponentChar : playerChar;
+  const p2Char = isClient ? playerChar : opponentChar;
+  player1 = new Fighter(p1Char, 120, 1, true);
+  player2 = new Fighter(p2Char, 280, -1, false);
   if (!isOnline) {
     cpuAI = new CpuAI(player2, player1);
   }
@@ -2408,8 +2415,8 @@ function drawHUD() {
   const isClient = isOnline && !isHost;
   const leftPlayer = isClient ? player2 : player1;
   const rightPlayer = isClient ? player1 : player2;
-  const leftChar = isClient ? opponentChar : playerChar;
-  const rightChar = isClient ? playerChar : opponentChar;
+  const leftChar = playerChar;   // Own char name always on left
+  const rightChar = opponentChar; // Opponent char name always on right
   const leftWins = isClient ? p2Wins : p1Wins;
   const rightWins = isClient ? p1Wins : p2Wins;
 
@@ -2559,7 +2566,8 @@ function drawRoundResult() {
     ctx.fillText('K.O.!!', W/2 + shake, 200);
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 20px monospace';
-    const winner = roundWinner === 1 ? playerChar?.name : opponentChar?.name;
+    const rwIsMe = (isOnline && !isHost) ? roundWinner === 2 : roundWinner === 1;
+    const winner = rwIsMe ? playerChar?.name : opponentChar?.name;
     ctx.fillText(`${winner} WIN!`, W/2, 245);
   } else if (roundResult === 'time') {
     ctx.fillStyle = '#ff0';
@@ -2567,7 +2575,8 @@ function drawRoundResult() {
     ctx.fillText('TIME UP!', W/2, 200);
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 20px monospace';
-    const winner = roundWinner === 1 ? playerChar?.name : opponentChar?.name;
+    const rwIsMe = (isOnline && !isHost) ? roundWinner === 2 : roundWinner === 1;
+    const winner = rwIsMe ? playerChar?.name : opponentChar?.name;
     ctx.fillText(`${winner} WIN!`, W/2, 245);
   }
 
@@ -2585,8 +2594,10 @@ function drawResult() {
   ctx.fillStyle = '#0a0a1a';
   ctx.fillRect(0, 0, W, H);
 
-  const winner = p1Wins >= 2 ? playerChar : opponentChar;
-  const isPlayerWin = (isOnline && !isHost) ? p2Wins >= 2 : p1Wins >= 2;
+  // For client: p1 is host(opponent), p2 is self
+  const isClient = isOnline && !isHost;
+  const isPlayerWin = isClient ? p2Wins >= 2 : p1Wins >= 2;
+  const winner = isPlayerWin ? playerChar : opponentChar;
 
   // Title
   ctx.fillStyle = isPlayerWin ? '#ffd700' : '#888';
@@ -2733,13 +2744,13 @@ function setupPeerConnection(conn) {
           }, 500);
         }
       } else if (msg.type === 'input' && isHost && player2) {
-        // Host receives client's input → apply to player2
-        // Client presses "left" means they move toward their left,
-        // but from host's perspective player2's left/right may be flipped
+        // Host receives client's input → apply directly to player2
+        // NO flip needed: world coordinates are absolute, both sides use same coordinate system
+        // Client left = world left, host left = world left
         const ci = msg.input;
         player2.input = {
-          left: ci.right,   // flip L/R because client sees mirrored view
-          right: ci.left,
+          left: ci.left,
+          right: ci.right,
           jump: ci.jump,
           attack: ci.attack,
           attackHold: ci.attackHold,
@@ -2860,7 +2871,9 @@ function sendGameState() {
     w2: p2Wins,
     rst: roundStartTimer,
     rsp: roundStartPhase,
-    rn: roundNum
+    rn: roundNum,
+    sm: slowMotion,
+    rt: roundTimer
   }));
 }
 
@@ -2877,17 +2890,21 @@ function applyGameState(msg) {
   roundStartTimer = msg.rst;
   roundStartPhase = msg.rsp;
   roundNum = msg.rn;
+  slowMotion = msg.sm || 0;
+  roundTimer = msg.rt || 0;
 
-  // Handle round transitions on client
+  // Handle round/game transitions on client
   if (roundResult && roundTimer > 150) {
+    stopBGM();
     if (p1Wins >= 2 || p2Wins >= 2) {
       gameScreen = 'result';
       resultTimer = 0;
       buttons.length = 0;
+    } else {
+      // New round - host will send new state, just reset local render state
+      roundNum = msg.rn;
     }
   }
-  if (roundResult) roundTimer++;
-  else roundTimer = 0;
 }
 
 // ========== MAIN GAME LOOP ==========
@@ -2912,7 +2929,8 @@ function update() {
   switch(gameScreen) {
     case 'fight':
       updateFight();
-      if (isOnline) sendInput();
+      // NOTE: sendInput is called INSIDE updateFight for client (with correct local input)
+      // Host sends game state inside updateFight at the end
       break;
   }
 }
