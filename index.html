@@ -108,7 +108,8 @@ function startBGM() {
         bgmNodes.push(o);
       }
     }
-    bgmNodes = bgmNodes.filter(n => { try { return n.context.currentTime < n.stop; } catch(e) { return false; } });
+    // Keep list manageable (old nodes auto-stop via scheduled stop time)
+    if (bgmNodes.length > 50) bgmNodes = bgmNodes.slice(-20);
     setTimeout(scheduleLoop, beat * 8 * 1000 - 100);
   }
   scheduleLoop();
@@ -982,8 +983,8 @@ class Fighter {
         this.vx = 0;
       }
 
-      // Special
-      if (this.input.special && this.meter >= this.maxMeter) {
+      // Special (cannot activate while blocking)
+      if (this.input.special && this.meter >= this.maxMeter && this.state !== 'block') {
         this.state = 'special';
         this.stateTimer = 30;
         this.meter = 0;
@@ -998,6 +999,7 @@ class Fighter {
           // Heavy attack
           this.state = 'attack_heavy';
           this.stateTimer = 20;
+          this.hitConfirm = false;
           this.comboCount = 0;
           this.comboTimer = 0;
         } else {
@@ -1336,8 +1338,17 @@ canvas.addEventListener('touchmove', (e) => {
     const pos = scaleTouch(t);
     const prev = touches[t.identifier];
     touches[t.identifier] = pos;
+    // Update button press state as finger moves
+    if (prev) {
+      const oldBtn = hitTestButton(prev.x, prev.y);
+      const newBtn = hitTestButton(pos.x, pos.y);
+      if (oldBtn !== newBtn) {
+        if (oldBtn) oldBtn.pressed = false;
+        if (newBtn) newBtn.pressed = true;
+      }
+    }
     // Swipe up detection for jump
-    if (prev && touchStartY[t.identifier] !== undefined) {
+    if (touchStartY[t.identifier] !== undefined) {
       if (pos.x < W/2 && touchStartY[t.identifier] - pos.y > 30) {
         const jumpBtn = buttons.find(b => b.id === 'jump');
         if (jumpBtn) jumpBtn.pressed = true;
@@ -1413,6 +1424,7 @@ let p1Wins = 0, p2Wins = 0;
 let revealTimer = 0;
 let revealPhase = 0;
 let lobbyMode = 'select'; // select, waiting, connected
+let lobbyError = '';
 let isOnline = false;
 let attackHoldCounter = 0;
 let resultTimer = 0;
@@ -1421,7 +1433,7 @@ let roundStartTimer = 0; // countdown before fight
 let roundStartPhase = ''; // 'round', 'fight', ''
 let slowMotion = 0; // slow-mo frames remaining
 let stageTheme = STAGE_THEMES[0];
-let comboDisplay = { count: 0, timer: 0, x: 0 };
+let comboDisplay = { p1: {count:0,timer:0}, p2: {count:0,timer:0} };
 let lastDashInput = { dir: '', time: 0 };
 
 // Lobby/Network state
@@ -1456,6 +1468,15 @@ function handleScreenTouch(pos, type) {
     case 'result':
       if (resultTimer > 60) {
         sfxSelect();
+        // Clean up network state
+        if (peer) { try { peer.destroy(); } catch(e){} peer = null; }
+        peerConnection = null;
+        isOnline = false;
+        networkReady = false;
+        isHost = false;
+        lobbyMode = 'select';
+        lobbyError = '';
+        stopBGM();
         gameScreen = 'title';
       }
       break;
@@ -1911,7 +1932,7 @@ function startRound() {
   attackHoldCounter = 0;
   particles.length = 0;
   floatingTexts.length = 0;
-  comboDisplay = { count: 0, timer: 0, x: 0 };
+  comboDisplay = { p1: {count:0,timer:0}, p2: {count:0,timer:0} };
   // Round start countdown
   roundStartTimer = 120; // 2 seconds
   roundStartPhase = 'round';
@@ -1955,18 +1976,28 @@ function updateFight() {
     roundTimer++;
     updateParticles();
     updateFloatingTexts();
-    if (roundTimer > 150) {
-      if (roundResult === 'ko' || roundResult === 'time') {
+    if (roundResult === 'disconnect') {
+      // Disconnect: go to result after brief delay
+      if (roundTimer > 90) {
         stopBGM();
-        if (p1Wins >= 2 || p2Wins >= 2) {
-          gameScreen = 'result';
-          resultTimer = 0;
-          buttons.length = 0;
-          return;
-        }
-        roundNum++;
-        startRound();
+        gameScreen = 'result';
+        resultTimer = 0;
+        buttons.length = 0;
       }
+      return;
+    }
+    if (roundTimer > 150) {
+      stopBGM();
+      if (p1Wins >= 2 || p2Wins >= 2) {
+        if (isOnline && isHost) sendGameOver();
+        gameScreen = 'result';
+        resultTimer = 0;
+        buttons.length = 0;
+        return;
+      }
+      roundNum++;
+      if (isOnline && isHost) sendNewRound();
+      startRound();
     }
     return;
   }
@@ -1987,6 +2018,7 @@ function updateFight() {
         roundWinner = 2;
         p2Wins++;
       } else {
+        roundWinner = 0; // draw
         p1Wins++;
         p2Wins++;
       }
@@ -1995,9 +2027,9 @@ function updateFight() {
   }
 
   // Combo display timer
-  if (comboDisplay.timer > 0) {
-    comboDisplay.timer--;
-    if (comboDisplay.timer <= 0) comboDisplay.count = 0; // reset combo after 1 sec
+  // Update combo timers for both players
+  for (const cd of [comboDisplay.p1, comboDisplay.p2]) {
+    if (cd.timer > 0) { cd.timer--; if (cd.timer <= 0) cd.count = 0; }
   }
 
   // === ONLINE CLIENT MODE: don't simulate, just receive state ===
@@ -2051,27 +2083,27 @@ function updateFight() {
     }
   }
 
-  // Check KO
-  if (player1.hp <= 0 && !roundResult) {
+  // Check KO (check both simultaneously for double KO)
+  const p1ko = player1.hp <= 0 && !roundResult;
+  const p2ko = player2.hp <= 0 && !roundResult;
+  if (p1ko && p2ko) {
+    // Double KO: both get a win
     roundResult = 'ko';
-    roundWinner = 2;
-    p2Wins++;
-    player1.state = 'ko';
-    addScreenShake(20);
-    slowMotion = 30;
+    roundWinner = 0;
+    p1Wins++; p2Wins++;
+    player1.state = 'ko'; player2.state = 'ko';
+    addScreenShake(25); slowMotion = 40;
+    addFloatingText(W/2, GROUND_Y - 100, 'DOUBLE K.O.!!', '#f0f', 28);
+    addParticle(W/2, GROUND_Y - 50, '#f0f', 30);
+  } else if (p1ko) {
+    roundResult = 'ko'; roundWinner = 2; p2Wins++;
+    player1.state = 'ko'; addScreenShake(20); slowMotion = 30;
     addParticle(player1.x, player1.y - 25, '#f00', 30);
-    addParticle(player1.x, player1.y - 25, '#ff0', 15);
     addFloatingText(player1.x, player1.y - 70, 'K.O.!!', '#f44', 28);
-  }
-  if (player2.hp <= 0 && !roundResult) {
-    roundResult = 'ko';
-    roundWinner = 1;
-    p1Wins++;
-    player2.state = 'ko';
-    addScreenShake(20);
-    slowMotion = 30;
+  } else if (p2ko) {
+    roundResult = 'ko'; roundWinner = 1; p1Wins++;
+    player2.state = 'ko'; addScreenShake(20); slowMotion = 30;
     addParticle(player2.x, player2.y - 25, '#f00', 30);
-    addParticle(player2.x, player2.y - 25, '#ff0', 15);
     addFloatingText(player2.x, player2.y - 70, 'K.O.!!', '#f44', 28);
   }
 
@@ -2108,7 +2140,8 @@ function checkAttackCollision(attacker, defender) {
       dmg = str * 0.6;
       // Combo bonus
       // Combo damage bonus based on hit combo count
-      const comboHits = attacker === player1 ? comboDisplay.count : 0;
+      const cd = attacker === player1 ? comboDisplay.p1 : comboDisplay.p2;
+      const comboHits = cd ? cd.count : 0;
       if (attacker.comboCount > 0 || comboHits > 0) {
         dmg *= (1 + Math.max(attacker.comboCount, comboHits) * 0.1);
       }
@@ -2130,14 +2163,14 @@ function checkAttackCollision(attacker, defender) {
     const dmgSize = attacker.specialActive ? 22 : attacker.state === 'attack_heavy' ? 18 : 14;
     addFloatingText(defender.x + (Math.random()-0.5)*20, defender.y - 40, String(dmg), dmgColor, dmgSize);
 
-    // Combo tracking & display
-    if (attacker === player1) {
-      comboDisplay.count++;
-      comboDisplay.timer = 60;
-      comboDisplay.x = defender.x;
-      if (comboDisplay.count >= 2) {
+    // Combo tracking & display (both players)
+    {
+      const cd = attacker === player1 ? comboDisplay.p1 : comboDisplay.p2;
+      cd.count++;
+      cd.timer = 60;
+      if (cd.count >= 2) {
         sfxCombo();
-        addFloatingText(defender.x, defender.y - 60, `${comboDisplay.count} HIT!`, '#0ff', 16);
+        addFloatingText(defender.x, defender.y - 60, `${cd.count} HIT!`, '#0ff', 16);
       }
     }
 
@@ -2308,13 +2341,16 @@ function drawFight() {
   drawHUD();
 
   // Combo display
-  if (comboDisplay.timer > 0 && comboDisplay.count >= 2) {
-    ctx.globalAlpha = comboDisplay.timer / 60;
-    ctx.fillStyle = '#0ff';
-    ctx.font = `bold ${14 + comboDisplay.count * 2}px monospace`;
-    ctx.textAlign = 'center';
-    ctx.fillText(`${comboDisplay.count} COMBO!`, W/2, 80);
-    ctx.globalAlpha = 1;
+  // Show combo for whichever player has an active combo
+  for (const cd of [comboDisplay.p1, comboDisplay.p2]) {
+    if (cd.timer > 0 && cd.count >= 2) {
+      ctx.globalAlpha = cd.timer / 60;
+      ctx.fillStyle = '#0ff';
+      ctx.font = `bold ${14 + cd.count * 2}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText(`${cd.count} COMBO!`, W/2, 80);
+      ctx.globalAlpha = 1;
+    }
   }
 
   // Round start overlay
@@ -2616,7 +2652,9 @@ function drawResult() {
   // Score
   ctx.fillStyle = '#aaa';
   ctx.font = '14px monospace';
-  ctx.fillText(`${p1Wins} - ${p2Wins}`, W/2, 360);
+  const myWins = isClient ? p2Wins : p1Wins;
+  const oppWins = isClient ? p1Wins : p2Wins;
+  ctx.fillText(`${myWins} - ${oppWins}`, W/2, 360);
 
   // Victory/defeat quote
   const quotes = isPlayerWin ? WIN_QUOTES : LOSE_QUOTES;
@@ -2674,11 +2712,16 @@ function createRoom() {
   peer.on('error', (err) => {
     console.error('PeerJS error:', err);
     if (err.type === 'unavailable-id') {
-      // Room code already in use, generate new one
-      roomCode = generateRoomCode();
-      peer.destroy();
-      createRoom();
-      return;
+      // Room code already in use, retry (max 3 times)
+      if (!createRoom._retries) createRoom._retries = 0;
+      createRoom._retries++;
+      if (createRoom._retries < 3) {
+        roomCode = generateRoomCode();
+        peer.destroy();
+        createRoom();
+        return;
+      }
+      createRoom._retries = 0;
     }
     lobbyMode = 'select';
     setupLobbyButtons();
@@ -2721,8 +2764,6 @@ function joinRoom(code) {
   });
 }
 
-let lobbyError = '';
-
 function setupPeerConnection(conn) {
   conn.on('open', () => {
     console.log('Peer connected!');
@@ -2758,8 +2799,16 @@ function setupPeerConnection(conn) {
           special: ci.special
         };
       } else if (msg.type === 'state' && !isHost) {
-        // Client receives full game state from host
         applyGameState(msg);
+      } else if (msg.type === 'gameover' && !isHost) {
+        p1Wins = msg.w1; p2Wins = msg.w2; roundWinner = msg.rw;
+        stopBGM();
+        gameScreen = 'result';
+        resultTimer = 0;
+        buttons.length = 0;
+      } else if (msg.type === 'newround' && !isHost) {
+        roundNum = msg.rn;
+        startRound();
       }
     } catch(e) {
       console.error('Data parse error:', e);
@@ -2772,8 +2821,12 @@ function setupPeerConnection(conn) {
     isOnline = false;
     if (gameScreen === 'fight') {
       roundResult = 'disconnect';
-      roundWinner = 1;
-      addFloatingText(W/2, H/2, '相手が切断しました', '#f44', 16);
+      // Surviving player wins: host=player1, client=player2
+      roundWinner = isHost ? 1 : 2;
+      p1Wins = isHost ? 2 : p1Wins;
+      p2Wins = isHost ? p2Wins : 2;
+      addFloatingText(W/2, H/2 - 30, '相手が切断しました', '#f44', 16);
+      addFloatingText(W/2, H/2, 'YOU WIN!', '#ff0', 20);
     }
   });
 
@@ -2858,6 +2911,19 @@ function applyFighterState(f, s) {
 }
 
 // Host sends full game state to client
+function sendGameOver() {
+  if (!peerConnection || !peerConnection.open) return;
+  peerConnection.send(JSON.stringify({
+    type: 'gameover',
+    w1: p1Wins, w2: p2Wins, rw: roundWinner
+  }));
+}
+
+function sendNewRound() {
+  if (!peerConnection || !peerConnection.open) return;
+  peerConnection.send(JSON.stringify({ type: 'newround', rn: roundNum }));
+}
+
 function sendGameState() {
   if (!peerConnection || !peerConnection.open || !player1 || !player2) return;
   peerConnection.send(JSON.stringify({
@@ -2893,18 +2959,7 @@ function applyGameState(msg) {
   slowMotion = msg.sm || 0;
   roundTimer = msg.rt || 0;
 
-  // Handle round/game transitions on client
-  if (roundResult && roundTimer > 150) {
-    stopBGM();
-    if (p1Wins >= 2 || p2Wins >= 2) {
-      gameScreen = 'result';
-      resultTimer = 0;
-      buttons.length = 0;
-    } else {
-      // New round - host will send new state, just reset local render state
-      roundNum = msg.rn;
-    }
-  }
+  // Round/game transitions now handled by explicit 'gameover'/'newround' messages
 }
 
 // ========== MAIN GAME LOOP ==========
