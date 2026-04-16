@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
 <title>Psychology Fighter</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;overflow:hidden;background:#000;touch-action:none;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none}
@@ -1425,9 +1426,8 @@ let lastDashInput = { dir: '', time: 0 };
 
 // Lobby/Network state
 let roomCode = '';
-let ws = null;
-let peerConn = null;
-let dataChannel = null;
+// PeerJS (old ws/peerConn/dataChannel removed)
+
 let isHost = false;
 let networkReady = false;
 
@@ -1863,6 +1863,14 @@ function drawLobby() {
     ctx.fillText('対戦相手が見つかりました！', W/2, 300);
     ctx.fillStyle = C.subtitle;
     ctx.fillText('準備中...', W/2, 350);
+  }
+
+  // Error message
+  if (lobbyError && lobbyMode === 'select') {
+    ctx.fillStyle = '#f44';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(lobbyError, W/2, H - 30);
   }
 }
 
@@ -2608,7 +2616,11 @@ function drawResult() {
   }
 }
 
-// ========== NETWORKING ==========
+// ========== NETWORKING (PeerJS - no server needed) ==========
+let peer = null;
+let peerConnection = null; // PeerJS DataConnection
+const PEER_PREFIX = 'psyfighter-';
+
 function generateRoomCode() {
   const chars = 'ABCDEFGHIJ0123456789';
   let code = '';
@@ -2620,122 +2632,130 @@ function createRoom() {
   roomCode = generateRoomCode();
   lobbyMode = 'waiting';
   isHost = true;
-  connectSignaling();
+  const peerId = PEER_PREFIX + roomCode;
+
+  // Destroy old peer if exists
+  if (peer) { try { peer.destroy(); } catch(e){} }
+
+  peer = new Peer(peerId, {
+    config: { iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' }
+    ]}
+  });
+
+  peer.on('open', (id) => {
+    console.log('Room created:', roomCode, 'PeerID:', id);
+  });
+
+  peer.on('connection', (conn) => {
+    peerConnection = conn;
+    setupPeerConnection(conn);
+  });
+
+  peer.on('error', (err) => {
+    console.error('PeerJS error:', err);
+    if (err.type === 'unavailable-id') {
+      // Room code already in use, generate new one
+      roomCode = generateRoomCode();
+      peer.destroy();
+      createRoom();
+      return;
+    }
+    lobbyMode = 'select';
+    setupLobbyButtons();
+    lobbyError = '接続エラー: ' + (err.type || err.message || '不明');
+  });
 }
 
 function joinRoom(code) {
   roomCode = code;
   lobbyMode = 'waiting';
   isHost = false;
-  connectSignaling();
-}
+  const targetPeerId = PEER_PREFIX + roomCode;
 
-function connectSignaling() {
-  // Try to connect to signaling server
-  try {
-    ws = new WebSocket('ws://localhost:8080');
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'join', room: roomCode, charData: playerChar }));
-    };
-    ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      handleSignalingMessage(msg);
-    };
-    ws.onerror = () => {
-      lobbyMode = 'select';
-      setupLobbyButtons();
-      alert('サーバーに接続できません。server.jsを起動してください。');
-    };
-    ws.onclose = () => {
-      if (lobbyMode === 'waiting') {
-        lobbyMode = 'select';
-        setupLobbyButtons();
-      }
-    };
-  } catch (e) {
+  // Destroy old peer if exists
+  if (peer) { try { peer.destroy(); } catch(e){} }
+
+  peer = new Peer(undefined, {
+    config: { iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' }
+    ]}
+  });
+
+  peer.on('open', () => {
+    console.log('Joining room:', roomCode);
+    const conn = peer.connect(targetPeerId, { reliable: true });
+    peerConnection = conn;
+    setupPeerConnection(conn);
+  });
+
+  peer.on('error', (err) => {
+    console.error('PeerJS error:', err);
     lobbyMode = 'select';
     setupLobbyButtons();
-  }
-}
-
-function handleSignalingMessage(msg) {
-  switch(msg.type) {
-    case 'room-ready':
-      opponentChar = msg.opponentChar;
-      lobbyMode = 'connected';
-      setupWebRTC();
-      break;
-    case 'signal':
-      handleRTCSignal(msg.data);
-      break;
-    case 'opponent-char':
-      opponentChar = msg.charData;
-      break;
-  }
-}
-
-function setupWebRTC() {
-  const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
-  peerConn = new RTCPeerConnection(config);
-
-  peerConn.onicecandidate = (e) => {
-    if (e.candidate && ws) {
-      ws.send(JSON.stringify({ type: 'signal', data: { candidate: e.candidate } }));
+    if (err.type === 'peer-unavailable') {
+      lobbyError = '部屋が見つかりません: ' + roomCode;
+    } else {
+      lobbyError = '接続エラー: ' + (err.type || err.message || '不明');
     }
-  };
-
-  if (isHost) {
-    dataChannel = peerConn.createDataChannel('game', { ordered: false, maxRetransmits: 0 });
-    setupDataChannel(dataChannel);
-    peerConn.createOffer().then(offer => {
-      peerConn.setLocalDescription(offer);
-      ws.send(JSON.stringify({ type: 'signal', data: { sdp: offer } }));
-    });
-  } else {
-    peerConn.ondatachannel = (e) => {
-      dataChannel = e.channel;
-      setupDataChannel(dataChannel);
-    };
-  }
+  });
 }
 
-function handleRTCSignal(data) {
-  if (!peerConn) return;
-  if (data.sdp) {
-    peerConn.setRemoteDescription(new RTCSessionDescription(data.sdp)).then(() => {
-      if (data.sdp.type === 'offer') {
-        peerConn.createAnswer().then(answer => {
-          peerConn.setLocalDescription(answer);
-          ws.send(JSON.stringify({ type: 'signal', data: { sdp: answer } }));
-        });
+let lobbyError = '';
+
+function setupPeerConnection(conn) {
+  conn.on('open', () => {
+    console.log('Peer connected!');
+    lobbyMode = 'connected';
+    // Send our character data
+    conn.send(JSON.stringify({ type: 'char', charData: playerChar }));
+  });
+
+  conn.on('data', (data) => {
+    try {
+      const msg = typeof data === 'string' ? JSON.parse(data) : data;
+      if (msg.type === 'char') {
+        opponentChar = msg.charData;
+        // If both players have char data, start the fight
+        if (playerChar && opponentChar) {
+          networkReady = true;
+          isOnline = true;
+          // Small delay to ensure both sides are ready
+          setTimeout(() => {
+            if (gameScreen === 'lobby') startFight();
+          }, 500);
+        }
+      } else if (msg.type === 'input' && player2) {
+        player2.input = msg.input;
       }
-    });
-  } else if (data.candidate) {
-    peerConn.addIceCandidate(new RTCIceCandidate(data.candidate));
-  }
-}
-
-function setupDataChannel(ch) {
-  ch.onopen = () => {
-    networkReady = true;
-    isOnline = true;
-    startFight();
-  };
-  ch.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'input' && player2) {
-      player2.input = msg.input;
+    } catch(e) {
+      console.error('Data parse error:', e);
     }
-  };
-  ch.onclose = () => {
+  });
+
+  conn.on('close', () => {
+    console.log('Peer disconnected');
     networkReady = false;
     isOnline = false;
-  };
+    if (gameScreen === 'fight') {
+      roundResult = 'disconnect';
+      roundWinner = 1;
+      addFloatingText(W/2, H/2, '相手が切断しました', '#f44', 16);
+    }
+  });
+
+  conn.on('error', (err) => {
+    console.error('Connection error:', err);
+    networkReady = false;
+    isOnline = false;
+  });
 }
 
 function sendInput() {
-  if (dataChannel && dataChannel.readyState === 'open') {
-    dataChannel.send(JSON.stringify({
+  if (peerConnection && peerConnection.open) {
+    peerConnection.send(JSON.stringify({
       type: 'input',
       input: player1.input
     }));
