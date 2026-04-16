@@ -1993,30 +1993,24 @@ function updateFight() {
     if (comboDisplay.timer <= 0) comboDisplay.count = 0; // reset combo after 1 sec
   }
 
-  // Player input from buttons
-  player1.input.left = isButtonPressed('left');
-  player1.input.right = isButtonPressed('right');
-  player1.input.jump = isButtonPressed('jump');
-  player1.input.block = isButtonPressed('block');
-  player1.input.special = isButtonPressed('special');
-
-  if (isButtonPressed('attack')) {
-    attackHoldCounter++;
-    if (attackHoldCounter > 18) {
-      player1.input.attack = true;
-      player1.input.attackHold = attackHoldCounter;
-    }
-  } else {
-    if (attackHoldCounter > 0 && attackHoldCounter <= 18) {
-      player1.input.attack = true;
-      player1.input.attackHold = attackHoldCounter;
-    } else {
-      player1.input.attack = false;
-    }
-    attackHoldCounter = 0;
+  // === ONLINE CLIENT MODE: don't simulate, just receive state ===
+  if (isOnline && !isHost) {
+    // Client sends own input to host
+    const myInput = readLocalInput();
+    sendInput(myInput);
+    // State is applied in onData handler
+    updateParticles();
+    updateFloatingTexts();
+    return;
   }
 
-  // CPU AI
+  // === LOCAL or HOST MODE: read input & simulate ===
+  // Determine which fighter the local player controls
+  const localFighter = player1; // Host always controls player1
+  const localInput = readLocalInput();
+  localFighter.input = localInput;
+
+  // CPU AI or remote player input (applied via onData for online)
   if (!isOnline && cpuAI) {
     cpuAI.update();
   }
@@ -2076,6 +2070,11 @@ function updateFight() {
 
   updateParticles();
   updateFloatingTexts();
+
+  // Host sends game state to client every frame
+  if (isOnline && isHost) {
+    sendGameState();
+  }
 }
 
 function checkAttackCollision(attacker, defender) {
@@ -2405,22 +2404,31 @@ function drawStage() {
 }
 
 function drawHUD() {
+  // For online client: swap left/right so "me" is always on the left
+  const isClient = isOnline && !isHost;
+  const leftPlayer = isClient ? player2 : player1;
+  const rightPlayer = isClient ? player1 : player2;
+  const leftChar = isClient ? opponentChar : playerChar;
+  const rightChar = isClient ? playerChar : opponentChar;
+  const leftWins = isClient ? p2Wins : p1Wins;
+  const rightWins = isClient ? p1Wins : p2Wins;
+
   const barW = 150, barH = 16, barY = 15;
 
-  // P1 HP
+  // Left HP
   ctx.fillStyle = '#333';
   ctx.fillRect(10, barY, barW, barH);
-  const p1Ratio = Math.max(0, player1.hp / player1.maxHp);
+  const p1Ratio = Math.max(0, leftPlayer.hp / leftPlayer.maxHp);
   ctx.fillStyle = p1Ratio > 0.5 ? '#4a4' : p1Ratio > 0.25 ? '#aa4' : '#a44';
   ctx.fillRect(10, barY, barW * p1Ratio, barH);
   ctx.strokeStyle = '#fff';
   ctx.lineWidth = 1;
   ctx.strokeRect(10, barY, barW, barH);
 
-  // P2 HP
+  // Right HP
   ctx.fillStyle = '#333';
   ctx.fillRect(W - 10 - barW, barY, barW, barH);
-  const p2Ratio = Math.max(0, player2.hp / player2.maxHp);
+  const p2Ratio = Math.max(0, rightPlayer.hp / rightPlayer.maxHp);
   ctx.fillStyle = p2Ratio > 0.5 ? '#4a4' : p2Ratio > 0.25 ? '#aa4' : '#a44';
   ctx.fillRect(W - 10 - barW * p2Ratio, barY, barW * p2Ratio, barH);
   ctx.strokeStyle = '#fff';
@@ -2430,35 +2438,33 @@ function drawHUD() {
   ctx.fillStyle = '#fff';
   ctx.font = '10px monospace';
   ctx.textAlign = 'left';
-  ctx.fillText(`${Math.max(0,Math.ceil(player1.hp))}`, 12, barY + 12);
+  ctx.fillText(`${Math.max(0,Math.ceil(leftPlayer.hp))}`, 12, barY + 12);
   ctx.textAlign = 'right';
-  ctx.fillText(`${Math.max(0,Math.ceil(player2.hp))}`, W - 12, barY + 12);
+  ctx.fillText(`${Math.max(0,Math.ceil(rightPlayer.hp))}`, W - 12, barY + 12);
 
   // Meter bars
   const mBarH = 6;
   ctx.fillStyle = '#222';
   ctx.fillRect(10, barY + barH + 3, barW, mBarH);
-  ctx.fillStyle = player1.meter >= player1.maxMeter ? '#f5a623' : '#885510';
-  ctx.fillRect(10, barY + barH + 3, barW * (player1.meter / player1.maxMeter), mBarH);
+  ctx.fillStyle = leftPlayer.meter >= leftPlayer.maxMeter ? '#f5a623' : '#885510';
+  ctx.fillRect(10, barY + barH + 3, barW * (leftPlayer.meter / leftPlayer.maxMeter), mBarH);
 
   ctx.fillStyle = '#222';
   ctx.fillRect(W - 10 - barW, barY + barH + 3, barW, mBarH);
-  ctx.fillStyle = player2.meter >= player2.maxMeter ? '#f5a623' : '#885510';
-  ctx.fillRect(W - 10 - barW * (player2.meter / player2.maxMeter), barY + barH + 3, barW * (player2.meter / player2.maxMeter), mBarH);
+  ctx.fillStyle = rightPlayer.meter >= rightPlayer.maxMeter ? '#f5a623' : '#885510';
+  ctx.fillRect(W - 10 - barW * (rightPlayer.meter / rightPlayer.maxMeter), barY + barH + 3, barW * (rightPlayer.meter / rightPlayer.maxMeter), mBarH);
 
   // Guard gauge bars
   const gBarY = barY + barH + mBarH + 5;
   const gBarH = 4;
-  // P1 guard
   ctx.fillStyle = '#222';
   ctx.fillRect(10, gBarY, barW, gBarH);
-  const g1Ratio = player1.guardGauge / player1.maxGuardGauge;
+  const g1Ratio = leftPlayer.guardGauge / leftPlayer.maxGuardGauge;
   ctx.fillStyle = g1Ratio > 0.3 ? '#48f' : '#f44';
   ctx.fillRect(10, gBarY, barW * g1Ratio, gBarH);
-  // P2 guard
   ctx.fillStyle = '#222';
   ctx.fillRect(W - 10 - barW, gBarY, barW, gBarH);
-  const g2Ratio = player2.guardGauge / player2.maxGuardGauge;
+  const g2Ratio = rightPlayer.guardGauge / rightPlayer.maxGuardGauge;
   ctx.fillStyle = g2Ratio > 0.3 ? '#48f' : '#f44';
   ctx.fillRect(W - 10 - barW * g2Ratio, gBarY, barW * g2Ratio, gBarH);
 
@@ -2466,9 +2472,9 @@ function drawHUD() {
   ctx.font = '10px monospace';
   ctx.fillStyle = '#aaa';
   ctx.textAlign = 'left';
-  ctx.fillText(playerChar?.name || 'P1', 10, gBarY + gBarH + 10);
+  ctx.fillText(leftChar?.name || 'P1', 10, gBarY + gBarH + 10);
   ctx.textAlign = 'right';
-  ctx.fillText(opponentChar?.name || 'P2', W - 10, gBarY + gBarH + 10);
+  ctx.fillText(rightChar?.name || 'P2', W - 10, gBarY + gBarH + 10);
 
   // Timer
   ctx.fillStyle = '#fff';
@@ -2483,13 +2489,13 @@ function drawHUD() {
 
   // Win dots
   for (let i = 0; i < 2; i++) {
-    ctx.fillStyle = i < p1Wins ? '#f5a623' : '#333';
+    ctx.fillStyle = i < leftWins ? '#f5a623' : '#333';
     ctx.beginPath();
     ctx.arc(W/2 - 25 + i * 12, 55, 4, 0, Math.PI*2);
     ctx.fill();
   }
   for (let i = 0; i < 2; i++) {
-    ctx.fillStyle = i < p2Wins ? '#f5a623' : '#333';
+    ctx.fillStyle = i < rightWins ? '#f5a623' : '#333';
     ctx.beginPath();
     ctx.arc(W/2 + 15 + i * 12, 55, 4, 0, Math.PI*2);
     ctx.fill();
@@ -2517,7 +2523,8 @@ function drawControls() {
     ctx.fill();
 
     // Special button glow when meter full
-    if (btn.id === 'special' && player1 && player1.meter >= player1.maxMeter) {
+    const myFighter = (isOnline && !isHost) ? player2 : player1;
+    if (btn.id === 'special' && myFighter && myFighter.meter >= myFighter.maxMeter) {
       ctx.strokeStyle = '#ff0';
       ctx.lineWidth = 2;
       ctx.stroke();
@@ -2579,7 +2586,7 @@ function drawResult() {
   ctx.fillRect(0, 0, W, H);
 
   const winner = p1Wins >= 2 ? playerChar : opponentChar;
-  const isPlayerWin = p1Wins >= 2;
+  const isPlayerWin = (isOnline && !isHost) ? p2Wins >= 2 : p1Wins >= 2;
 
   // Title
   ctx.fillStyle = isPlayerWin ? '#ffd700' : '#888';
@@ -2718,17 +2725,30 @@ function setupPeerConnection(conn) {
       const msg = typeof data === 'string' ? JSON.parse(data) : data;
       if (msg.type === 'char') {
         opponentChar = msg.charData;
-        // If both players have char data, start the fight
         if (playerChar && opponentChar) {
           networkReady = true;
           isOnline = true;
-          // Small delay to ensure both sides are ready
           setTimeout(() => {
             if (gameScreen === 'lobby') startFight();
           }, 500);
         }
-      } else if (msg.type === 'input' && player2) {
-        player2.input = msg.input;
+      } else if (msg.type === 'input' && isHost && player2) {
+        // Host receives client's input → apply to player2
+        // Client presses "left" means they move toward their left,
+        // but from host's perspective player2's left/right may be flipped
+        const ci = msg.input;
+        player2.input = {
+          left: ci.right,   // flip L/R because client sees mirrored view
+          right: ci.left,
+          jump: ci.jump,
+          attack: ci.attack,
+          attackHold: ci.attackHold,
+          block: ci.block,
+          special: ci.special
+        };
+      } else if (msg.type === 'state' && !isHost) {
+        // Client receives full game state from host
+        applyGameState(msg);
       }
     } catch(e) {
       console.error('Data parse error:', e);
@@ -2753,13 +2773,121 @@ function setupPeerConnection(conn) {
   });
 }
 
-function sendInput() {
+function sendInput(input) {
   if (peerConnection && peerConnection.open) {
     peerConnection.send(JSON.stringify({
       type: 'input',
-      input: player1.input
+      input: input || player1.input
     }));
   }
+}
+
+// Read local button state into an input object
+function readLocalInput() {
+  const input = {
+    left: isButtonPressed('left'),
+    right: isButtonPressed('right'),
+    jump: isButtonPressed('jump'),
+    block: isButtonPressed('block'),
+    special: isButtonPressed('special'),
+    attack: false,
+    attackHold: 0
+  };
+  if (isButtonPressed('attack')) {
+    attackHoldCounter++;
+    if (attackHoldCounter > 18) {
+      input.attack = true;
+      input.attackHold = attackHoldCounter;
+    }
+  } else {
+    if (attackHoldCounter > 0 && attackHoldCounter <= 18) {
+      input.attack = true;
+      input.attackHold = attackHoldCounter;
+    }
+    attackHoldCounter = 0;
+  }
+  return input;
+}
+
+// Extract fighter state for network sync
+function extractFighterState(f) {
+  return {
+    x: Math.round(f.x * 10) / 10,
+    y: Math.round(f.y * 10) / 10,
+    vx: Math.round(f.vx * 10) / 10,
+    vy: Math.round(f.vy * 10) / 10,
+    hp: Math.round(f.hp * 10) / 10,
+    meter: Math.round(f.meter),
+    guardGauge: Math.round(f.guardGauge),
+    state: f.state,
+    stateTimer: f.stateTimer,
+    facing: f.facing,
+    animFrame: f.animFrame,
+    invincible: f.invincible,
+    guardBroken: f.guardBroken,
+    specialActive: f.specialActive,
+    poisonTimer: f.poisonTimer,
+    strBoost: f.strBoost
+  };
+}
+
+// Apply state to a fighter
+function applyFighterState(f, s) {
+  f.x = s.x; f.y = s.y;
+  f.vx = s.vx; f.vy = s.vy;
+  f.hp = s.hp; f.meter = s.meter;
+  f.guardGauge = s.guardGauge;
+  f.state = s.state; f.stateTimer = s.stateTimer;
+  f.facing = s.facing; f.animFrame = s.animFrame;
+  f.invincible = s.invincible;
+  f.guardBroken = s.guardBroken;
+  f.specialActive = s.specialActive;
+  f.poisonTimer = s.poisonTimer;
+  f.strBoost = s.strBoost;
+}
+
+// Host sends full game state to client
+function sendGameState() {
+  if (!peerConnection || !peerConnection.open || !player1 || !player2) return;
+  peerConnection.send(JSON.stringify({
+    type: 'state',
+    p1: extractFighterState(player1),
+    p2: extractFighterState(player2),
+    ft: fightTimer,
+    rr: roundResult,
+    rw: roundWinner,
+    w1: p1Wins,
+    w2: p2Wins,
+    rst: roundStartTimer,
+    rsp: roundStartPhase,
+    rn: roundNum
+  }));
+}
+
+// Client applies game state from host
+function applyGameState(msg) {
+  if (!player1 || !player2) return;
+  applyFighterState(player1, msg.p1);
+  applyFighterState(player2, msg.p2);
+  fightTimer = msg.ft;
+  roundResult = msg.rr;
+  roundWinner = msg.rw;
+  p1Wins = msg.w1;
+  p2Wins = msg.w2;
+  roundStartTimer = msg.rst;
+  roundStartPhase = msg.rsp;
+  roundNum = msg.rn;
+
+  // Handle round transitions on client
+  if (roundResult && roundTimer > 150) {
+    if (p1Wins >= 2 || p2Wins >= 2) {
+      gameScreen = 'result';
+      resultTimer = 0;
+      buttons.length = 0;
+    }
+  }
+  if (roundResult) roundTimer++;
+  else roundTimer = 0;
 }
 
 // ========== MAIN GAME LOOP ==========
